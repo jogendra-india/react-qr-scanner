@@ -39,6 +39,13 @@ const LOW_LUMINANCE = 70;
 const HIGH_LUMINANCE = 160;
 const LOW_LUM_FRAMES_TO_ENGAGE = 20;
 const HIGH_LUM_FRAMES_TO_DISENGAGE = 30;
+// jsQR has a small but non-zero false-positive rate on cluttered backgrounds
+// (logos, posters, brick walls). Requiring N consecutive identical decodes
+// before reporting eliminates almost all of these at ~16ms*N latency cost.
+const JSQR_CONFIRM_FRAMES = 2;
+// Reject extremely short payloads — a real attendance QR is at least this long.
+// Tune in consumer instead of here if it ever needs to be stricter / looser.
+const MIN_PAYLOAD_LEN = 3;
 
 type JsQrResult = NonNullable<ReturnType<typeof jsQR>>;
 
@@ -102,7 +109,7 @@ export default function useScanner(props: IUseScannerProps) {
         formats = ['qr_code'],
         allowMultiple = false,
         sound = true,
-        roi = 0.85,
+        roi = 0.7,
         autoTorch = true
     }: IUseScannerProps = props;
 
@@ -117,6 +124,10 @@ export default function useScanner(props: IUseScannerProps) {
     const torchEngagedRef = useRef(false);
     const lowLumStreakRef = useRef(0);
     const highLumStreakRef = useRef(0);
+
+    // jsQR confirmation buffer — last decode value and streak count.
+    const jsqrLastValueRef = useRef<string | null>(null);
+    const jsqrStreakRef = useRef(0);
 
     useEffect(() => {
         if (typeof window !== 'undefined' && window.BarcodeDetector) {
@@ -226,33 +237,54 @@ export default function useScanner(props: IUseScannerProps) {
             if (!frame) return [];
             updateAutoTorch(frame.meanLuma);
 
-            const tryJsQr = (gray: Uint8ClampedArray): IDetectedBarcode[] => {
+            const tryJsQr = (gray: Uint8ClampedArray): string | null => {
                 const imgData = grayToImageData(gray, frame.width, frame.height);
                 const res = jsQR(imgData.data, frame.width, frame.height, { inversionAttempts: 'attemptBoth' });
-                if (!res) return [];
-                return [
-                    {
-                        rawValue: res.data,
-                        format: 'qr_code',
-                        boundingBox: makeBoundingBoxFromLocation(res),
-                        cornerPoints: [
-                            { x: res.location.topLeftCorner.x, y: res.location.topLeftCorner.y },
-                            { x: res.location.topRightCorner.x, y: res.location.topRightCorner.y },
-                            { x: res.location.bottomRightCorner.x, y: res.location.bottomRightCorner.y },
-                            { x: res.location.bottomLeftCorner.x, y: res.location.bottomLeftCorner.y }
-                        ]
-                    }
-                ];
+                if (!res) return null;
+                const v = res.data;
+                if (!v || v.length < MIN_PAYLOAD_LEN) return null;
+                return v;
             };
 
-            let hit = tryJsQr(frame.gray);
-            if (hit.length > 0) return hit;
+            const buildBarcode = (rawValue: string): IDetectedBarcode => ({
+                rawValue,
+                format: 'qr_code',
+                // jsQR returns location too, but we deliberately drop the bbox here:
+                // re-running jsQR a second time to recover corners after the
+                // confirmation streak is reached would double our CPU. The
+                // tracking overlay only matters when a tracker prop is supplied,
+                // which the consumer (kiosk attendance) does not use.
+                boundingBox: DOMRectReadOnly.fromRect({ x: 0, y: 0, width: 0, height: 0 }),
+                cornerPoints: []
+            });
 
-            const stretched = contrastStretch(frame.gray);
-            hit = tryJsQr(stretched);
-            if (hit.length > 0) return hit;
+            let value = tryJsQr(frame.gray);
+            if (!value) {
+                const stretched = contrastStretch(frame.gray);
+                value = tryJsQr(stretched);
+            }
 
-            return [];
+            if (value === null) {
+                // No hit — reset confirmation streak.
+                jsqrLastValueRef.current = null;
+                jsqrStreakRef.current = 0;
+                return [];
+            }
+
+            // Confirmation gate. Require the same value across N consecutive
+            // frames. Stops phantom decodes from cluttered backgrounds.
+            if (jsqrLastValueRef.current === value) {
+                jsqrStreakRef.current++;
+            } else {
+                jsqrLastValueRef.current = value;
+                jsqrStreakRef.current = 1;
+            }
+
+            if (jsqrStreakRef.current < JSQR_CONFIRM_FRAMES) {
+                return [];
+            }
+
+            return [buildBarcode(value)];
         },
         [grabFrame, updateAutoTorch]
     );
@@ -346,6 +378,8 @@ export default function useScanner(props: IUseScannerProps) {
         torchEngagedRef.current = false;
         lowLumStreakRef.current = 0;
         highLumStreakRef.current = 0;
+        jsqrLastValueRef.current = null;
+        jsqrStreakRef.current = 0;
     }, [onAutoTorch]);
 
     return {

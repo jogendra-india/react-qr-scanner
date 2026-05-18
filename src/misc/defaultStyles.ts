@@ -14,10 +14,7 @@ export const defaultStyles: IScannerStyles = {
     video: {
         width: '100%',
         height: '100%',
-        // `contain` shows the full camera frame (possible letterbox) so the
-        // image is not artificially zoomed/cropped. ROI cropping happens
-        // inside the decoder; the displayed feed stays true to the sensor.
-        objectFit: 'contain',
+        objectFit: 'cover',
         overflow: 'hidden'
     }
 };
