@@ -334,10 +334,19 @@ export default function useScanner(props: IUseScannerProps) {
             window.cancelAnimationFrame(animationFrameIdRef.current);
             animationFrameIdRef.current = null;
         }
+        // Physically disengage torch if we turned it on. Downstream face
+        // recognition needs the camera with no LED flooding the subject.
+        if (torchEngagedRef.current && onAutoTorch) {
+            try {
+                onAutoTorch(false);
+            } catch {
+                // Track may already be stopped — ignore.
+            }
+        }
         torchEngagedRef.current = false;
         lowLumStreakRef.current = 0;
         highLumStreakRef.current = 0;
-    }, []);
+    }, [onAutoTorch]);
 
     return {
         startScanning,
