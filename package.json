@@ -59,7 +59,6 @@
     "react-dom": "^17 || ^18 || ^19"
   },
   "dependencies": {
-    "barcode-detector": "3.0.3",
     "jsqr": "^1.4.0",
     "webrtc-adapter": "9.0.3"
   },

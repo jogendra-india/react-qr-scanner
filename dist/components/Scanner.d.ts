@@ -1,6 +1,5 @@
 import React, { ReactNode } from 'react';
-import type { BarcodeFormat } from 'barcode-detector';
-import { IDetectedBarcode, IScannerClassNames, IScannerComponents, IScannerStyles } from '../types';
+import { BarcodeFormat, IDetectedBarcode, IScannerClassNames, IScannerComponents, IScannerStyles } from '../types';
 export interface IScannerProps {
     onScan: (detectedCodes: IDetectedBarcode[]) => void;
     onError?: (error: unknown) => void;

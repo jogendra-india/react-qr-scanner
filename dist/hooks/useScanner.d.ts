@@ -1,9 +1,21 @@
 import { RefObject } from 'react';
-import { type DetectedBarcode, type BarcodeFormat } from 'barcode-detector';
+import { IDetectedBarcode, BarcodeFormat } from '../types';
+declare global {
+    interface Window {
+        BarcodeDetector?: {
+            new (options?: {
+                formats?: BarcodeFormat[];
+            }): {
+                detect: (source: CanvasImageSource) => Promise<IDetectedBarcode[]>;
+            };
+            getSupportedFormats?: () => Promise<BarcodeFormat[]>;
+        };
+    }
+}
 interface IUseScannerProps {
     videoElementRef: RefObject<HTMLVideoElement | null>;
-    onScan: (result: DetectedBarcode[]) => void;
-    onFound: (result: DetectedBarcode[]) => void;
+    onScan: (result: IDetectedBarcode[]) => void;
+    onFound: (result: IDetectedBarcode[]) => void;
     onAutoTorch?: (engage: boolean) => void;
     formats?: BarcodeFormat[];
     sound?: boolean | string;

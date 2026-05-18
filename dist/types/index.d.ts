@@ -9,4 +9,5 @@ export type { IStartCamera } from './IStartCamera';
 export type { IScannerStyles } from './IScannerStyles';
 export type { IScannerClassNames } from './IScannerClassNames';
 export type { TrackFunction } from './TrackFunction';
+export type { BarcodeFormat } from './BarcodeFormat';
 //# sourceMappingURL=index.d.ts.map

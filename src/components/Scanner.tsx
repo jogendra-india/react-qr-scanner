@@ -1,7 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, ReactNode } from 'react';
 
-import type { BarcodeFormat } from 'barcode-detector';
-
 import Finder from './Finder';
 import useCamera from '../hooks/useCamera';
 import useScanner from '../hooks/useScanner';
@@ -9,6 +7,7 @@ import useScanner from '../hooks/useScanner';
 import deepEqual from '../utilities/deepEqual';
 import { defaultComponents, defaultConstraints, defaultStyles } from '../misc';
 import {
+    BarcodeFormat,
     IDetectedBarcode,
     IPoint,
     IScannerClassNames,
