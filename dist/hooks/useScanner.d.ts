@@ -4,11 +4,14 @@ interface IUseScannerProps {
     videoElementRef: RefObject<HTMLVideoElement | null>;
     onScan: (result: DetectedBarcode[]) => void;
     onFound: (result: DetectedBarcode[]) => void;
+    onAutoTorch?: (engage: boolean) => void;
     formats?: BarcodeFormat[];
     sound?: boolean | string;
     allowMultiple?: boolean;
     retryDelay?: number;
     scanDelay?: number;
+    roi?: number;
+    autoTorch?: boolean;
 }
 export default function useScanner(props: IUseScannerProps): {
     startScanning: () => void;

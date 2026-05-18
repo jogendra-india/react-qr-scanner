@@ -60,6 +60,7 @@
   },
   "dependencies": {
     "barcode-detector": "3.0.3",
+    "jsqr": "^1.4.0",
     "webrtc-adapter": "9.0.3"
   },
   "packageManager": "yarn@4.0.2"

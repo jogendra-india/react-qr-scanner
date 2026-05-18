@@ -155,12 +155,29 @@ export function Scanner(props: IScannerProps) {
 
     const camera = useCamera();
 
+    const autoTorchHandler = async (engage: boolean) => {
+        try {
+            await camera.updateConstraints({
+                ...constraintsCached,
+                advanced: [{ torch: engage } as MediaTrackConstraintSet]
+            });
+        } catch (err) {
+            // Track may not support torch on this device — silently ignore.
+            console.debug('[Scanner] auto-torch toggle failed', err);
+        }
+    };
+
     const { startScanning, stopScanning } = useScanner({
         videoElementRef: videoRef,
         onScan: onScan,
         onFound: (detectedCodes) => onFound(detectedCodes, videoRef.current, trackingLayerRef.current, mergedComponents.tracker),
+        onAutoTorch: autoTorchHandler,
         formats: formats,
-        retryDelay: mergedComponents.tracker === undefined ? 500 : 10,
+        // retryDelay=0 lets RAF pace the loop at the display refresh rate, which
+        // gives the multi-pass decoder maximum opportunities per second. The
+        // tracker overlay only redraws when onFound fires, so a tracker no longer
+        // needs a separate cadence.
+        retryDelay: 0,
         scanDelay: scanDelay,
         allowMultiple: allowMultiple,
         sound: sound
