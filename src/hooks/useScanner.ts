@@ -185,15 +185,25 @@ export default function useScanner(props: IUseScannerProps) {
     const jsqrStreakRef = useRef(0);
 
     // Stuck-fallback gate. ZXing handles 99% of cases on its own and runs
-    // ~10ms per frame, so we want every frame to be a ZXing attempt (decoder
-    // saturates rAF at ~60fps). When ZXing misses ZXING_MISS_BEFORE_JSQR
-    // frames in a row (~80ms of no detection while the user is presenting a
-    // QR) we additionally run the jsQR passes as a second-opinion catch.
-    // jsQR sometimes catches edge cases ZXing does not (different finder
-    // pattern walk) at the cost of ~45ms per frame, so we limit it to the
-    // stuck path only and pay the cost just when we are clearly missing.
+    // ~10-20ms per frame, so we want every frame to be a ZXing attempt
+    // (decoder saturates rAF at ~60fps). When ZXing misses
+    // ZXING_MISS_BEFORE_JSQR frames in a row (~80ms of no detection while
+    // the user is presenting a QR) we additionally run the jsQR passes as
+    // a second-opinion catch. jsQR sometimes catches edge cases ZXing does
+    // not (different finder pattern walk).
+    //
+    // At 1280x720 jsQR alone is ~120ms per frame which, if invoked every
+    // frame, drags the whole decoder down to ~3 fps. To prevent the
+    // stuck-fallback path from itself becoming the bottleneck we (a) cap
+    // the jsQR working dimensions at JSQR_MAX_DIM (cheap downsample, ZXing
+    // still uses the full-resolution video element), and (b) rate-limit
+    // jsQR invocations to one per JSQR_MIN_INTERVAL_MS so ZXing keeps
+    // running at near-full speed between jsQR attempts.
     const zxingMissStreakRef = useRef(0);
+    const lastJsqrAttemptAtRef = useRef(0);
     const ZXING_MISS_BEFORE_JSQR = 5;
+    const JSQR_MIN_INTERVAL_MS = 200;
+    const JSQR_MAX_DIM = 640;
 
     // Ref-mirrored pauseDecoding so the long-lived rAF chain reads the
     // latest value without rebuilding the loop on every toggle.
@@ -260,22 +270,32 @@ export default function useScanner(props: IUseScannerProps) {
             const sx = Math.floor((vw - cropW) / 2);
             const sy = Math.floor((vh - cropH) / 2);
 
-            if (canvas.width !== cropW || canvas.height !== cropH) {
-                canvas.width = cropW;
-                canvas.height = cropH;
+            // Downscale to JSQR_MAX_DIM on the longer edge if the camera is
+            // running at HD or above. jsQR cost scales with pixel count, so
+            // 1280x720 -> 640x360 is a ~4x speedup with negligible loss for
+            // typical kiosk QR sizes. Cameras already capped at <= 640
+            // (older USB / VGA) skip the scale and pass through unchanged.
+            const longestEdge = Math.max(cropW, cropH);
+            const scale = longestEdge > JSQR_MAX_DIM ? JSQR_MAX_DIM / longestEdge : 1;
+            const outW = Math.max(1, Math.round(cropW * scale));
+            const outH = Math.max(1, Math.round(cropH * scale));
+
+            if (canvas.width !== outW || canvas.height !== outH) {
+                canvas.width = outW;
+                canvas.height = outH;
             }
 
-            ctx.drawImage(videoEl, sx, sy, cropW, cropH, 0, 0, cropW, cropH);
-            const img = ctx.getImageData(0, 0, cropW, cropH);
+            ctx.drawImage(videoEl, sx, sy, cropW, cropH, 0, 0, outW, outH);
+            const img = ctx.getImageData(0, 0, outW, outH);
             const rgba = img.data;
-            const gray = new Uint8ClampedArray(cropW * cropH);
+            const gray = new Uint8ClampedArray(outW * outH);
             let lumaSum = 0;
             for (let i = 0, j = 0; i < rgba.length; i += 4, j++) {
                 const y = (rgba[i] * 0.2126 + rgba[i + 1] * 0.7152 + rgba[i + 2] * 0.0722) | 0;
                 gray[j] = y;
                 lumaSum += y;
             }
-            return { gray, width: cropW, height: cropH, meanLuma: lumaSum / gray.length };
+            return { gray, width: outW, height: outH, meanLuma: lumaSum / gray.length };
         },
         [roi]
     );
@@ -345,13 +365,21 @@ export default function useScanner(props: IUseScannerProps) {
             }
 
             // When ZXing is the active path, the per-frame jsQR work is the
-            // dominant cost (~45ms). Skip it on every ZXing miss and only run
-            // it once the miss streak is long enough that ZXing is clearly
-            // failing on this particular QR/lighting. This lets the decoder
-            // run at near rAF cadence on the common path while still keeping
-            // jsQR as a second-opinion catch when we are stuck.
-            if (native && nativeMissed && zxingMissStreakRef.current < ZXING_MISS_BEFORE_JSQR) {
-                return [];
+            // dominant cost (even after downsampling — still ~25ms). Two
+            // gates: (a) miss streak must reach ZXING_MISS_BEFORE_JSQR
+            // before jsQR is allowed to run at all, and (b) once unlocked
+            // jsQR runs at most once per JSQR_MIN_INTERVAL_MS so ZXing keeps
+            // ticking at near-rAF cadence between attempts. Without (b) a
+            // long miss streak would pin the decoder to jsQR's frame budget.
+            if (native && nativeMissed) {
+                if (zxingMissStreakRef.current < ZXING_MISS_BEFORE_JSQR) {
+                    return [];
+                }
+                const nowTs = performance.now();
+                if (nowTs - lastJsqrAttemptAtRef.current < JSQR_MIN_INTERVAL_MS) {
+                    return [];
+                }
+                lastJsqrAttemptAtRef.current = nowTs;
             }
 
             // Pass 2..3: jsQR on a preprocessed greyscale frame. Pure JS,
@@ -555,6 +583,7 @@ export default function useScanner(props: IUseScannerProps) {
         jsqrLastValueRef.current = null;
         jsqrStreakRef.current = 0;
         zxingMissStreakRef.current = 0;
+        lastJsqrAttemptAtRef.current = 0;
     }, [onAutoTorch]);
 
     return {
