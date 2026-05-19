@@ -230,27 +230,60 @@ export default function useScanner(props: IUseScannerProps) {
             // the browser lacks native support — we never fall back to a polyfill
             // that fetches WASM from a CDN.
             const native = nativeDetectorRef.current;
+            const passStart = performance.now();
             if (native) {
+                const nativeStart = performance.now();
                 try {
                     const hits = await native.detect(videoEl);
-                    if (hits.length > 0) return hits;
-                } catch {
+                    const nativeMs = performance.now() - nativeStart;
+                    if (hits.length > 0) {
+                        // eslint-disable-next-line no-console
+                        console.log(`[QR-fork] BarcodeDetector HIT in ${nativeMs.toFixed(1)}ms value="${hits[0].rawValue}" (video ${videoEl.videoWidth}x${videoEl.videoHeight})`);
+                        return hits;
+                    }
+                    // eslint-disable-next-line no-console
+                    console.log(`[QR-fork] BarcodeDetector miss in ${nativeMs.toFixed(1)}ms (video ${videoEl.videoWidth}x${videoEl.videoHeight}) -> jsQR fallback`);
+                } catch (err) {
+                    const nativeMs = performance.now() - nativeStart;
+                    // eslint-disable-next-line no-console
+                    console.log(`[QR-fork] BarcodeDetector threw in ${nativeMs.toFixed(1)}ms`, err);
                     // detect() occasionally throws on torn frames; ignore and continue.
                 }
+            } else {
+                // eslint-disable-next-line no-console
+                console.log('[QR-fork] BarcodeDetector unavailable -> jsQR fallback only');
             }
 
             // Pass 2..3: jsQR on a preprocessed greyscale frame. Pure JS, bundled,
             // works offline. Inversion attempts handle white-on-dark codes.
+            const grabStart = performance.now();
             const frame = grabFrame(videoEl);
-            if (!frame) return [];
+            const grabMs = performance.now() - grabStart;
+            if (!frame) {
+                // eslint-disable-next-line no-console
+                console.log(`[QR-fork] grabFrame returned null in ${grabMs.toFixed(1)}ms`);
+                return [];
+            }
             updateAutoTorch(frame.meanLuma);
 
-            const tryJsQr = (gray: Uint8ClampedArray): string | null => {
+            const tryJsQr = (gray: Uint8ClampedArray, label: string): string | null => {
+                const t0 = performance.now();
                 const imgData = grayToImageData(gray, frame.width, frame.height);
                 const res = jsQR(imgData.data, frame.width, frame.height, { inversionAttempts: 'attemptBoth' });
-                if (!res) return null;
+                const ms = performance.now() - t0;
+                if (!res) {
+                    // eslint-disable-next-line no-console
+                    console.log(`[QR-fork] jsQR-${label} miss ${frame.width}x${frame.height} in ${ms.toFixed(1)}ms (luma ${frame.meanLuma.toFixed(0)})`);
+                    return null;
+                }
                 const v = res.data;
-                if (!v || v.length < MIN_PAYLOAD_LEN) return null;
+                if (!v || v.length < MIN_PAYLOAD_LEN) {
+                    // eslint-disable-next-line no-console
+                    console.log(`[QR-fork] jsQR-${label} too short "${v}" len=${v ? v.length : 0} in ${ms.toFixed(1)}ms`);
+                    return null;
+                }
+                // eslint-disable-next-line no-console
+                console.log(`[QR-fork] jsQR-${label} HIT "${v}" ${frame.width}x${frame.height} in ${ms.toFixed(1)}ms`);
                 return v;
             };
 
@@ -266,16 +299,19 @@ export default function useScanner(props: IUseScannerProps) {
                 cornerPoints: []
             });
 
-            let value = tryJsQr(frame.gray);
+            let value = tryJsQr(frame.gray, 'gray');
             if (!value) {
                 const stretched = contrastStretch(frame.gray);
-                value = tryJsQr(stretched);
+                value = tryJsQr(stretched, 'stretched');
             }
 
+            const totalMs = performance.now() - passStart;
             if (value === null) {
                 // No hit — reset confirmation streak.
                 jsqrLastValueRef.current = null;
                 jsqrStreakRef.current = 0;
+                // eslint-disable-next-line no-console
+                console.log(`[QR-fork] decode total ${totalMs.toFixed(1)}ms grabFrame=${grabMs.toFixed(1)}ms NO_HIT`);
                 return [];
             }
 
@@ -289,9 +325,13 @@ export default function useScanner(props: IUseScannerProps) {
             }
 
             if (jsqrStreakRef.current < JSQR_CONFIRM_FRAMES) {
+                // eslint-disable-next-line no-console
+                console.log(`[QR-fork] decode total ${totalMs.toFixed(1)}ms streak=${jsqrStreakRef.current}/${JSQR_CONFIRM_FRAMES} GATED`);
                 return [];
             }
 
+            // eslint-disable-next-line no-console
+            console.log(`[QR-fork] decode total ${totalMs.toFixed(1)}ms FIRE value="${value}"`);
             return [buildBarcode(value)];
         },
         [grabFrame, updateAutoTorch]
@@ -301,6 +341,8 @@ export default function useScanner(props: IUseScannerProps) {
         (state: IUseScannerState) => async (timeNow: number) => {
             const videoEl = videoElementRef.current;
             if (videoEl === null || videoEl.readyState <= 1) {
+                // eslint-disable-next-line no-console
+                console.log(`[QR-fork] frame skip: video not ready (readyState=${videoEl ? videoEl.readyState : 'null'})`);
                 animationFrameIdRef.current = window.requestAnimationFrame(processFrame(state));
                 return;
             }
@@ -313,16 +355,25 @@ export default function useScanner(props: IUseScannerProps) {
             }
 
             if (decodeInFlightRef.current) {
+                // eslint-disable-next-line no-console
+                console.log('[QR-fork] frame skip: decode in flight');
                 animationFrameIdRef.current = window.requestAnimationFrame(processFrame(state));
                 return;
             }
 
+            const sinceLast = timeNow - lastScan;
             decodeInFlightRef.current = true;
             let detectedCodes: IDetectedBarcode[] = [];
+            const decodeStart = performance.now();
             try {
                 detectedCodes = await decodeMultiPass(videoEl);
             } finally {
                 decodeInFlightRef.current = false;
+            }
+            const decodeWallMs = performance.now() - decodeStart;
+            if (decodeWallMs > 50) {
+                // eslint-disable-next-line no-console
+                console.log(`[QR-fork] frame decode wall=${decodeWallMs.toFixed(1)}ms gap-since-prev=${sinceLast.toFixed(1)}ms hits=${detectedCodes.length}`);
             }
 
             const anyNewCodesDetected = detectedCodes.some((code) => !contentBefore.includes(code.rawValue));
