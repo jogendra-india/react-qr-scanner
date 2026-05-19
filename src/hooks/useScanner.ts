@@ -2,14 +2,32 @@ import { useRef, useCallback, useEffect, RefObject } from 'react';
 
 import jsQR from 'jsqr';
 
+import {
+    BarcodeDetector as PolyfillBarcodeDetector,
+    setZXingModuleOverrides
+} from 'barcode-detector/pure';
+
 import { IDetectedBarcode, IUseScannerState, BarcodeFormat } from '../types';
 
 import { base64Beep } from '../assets/base64Beep';
 
+// ZXing-WASM polyfill (used when native window.BarcodeDetector is missing —
+// kiosk Chromium builds typically lack it). The WASM file ships with the
+// consumer at /wasm/zxing_reader.wasm so nothing is ever fetched from a CDN.
+// Service workers in the consumer also rewrite any jsdelivr ZXing URL to the
+// same local path as a belt-and-braces guard. The polyfill expects the
+// override to be set BEFORE the first detect() call.
+setZXingModuleOverrides({
+    locateFile: (path: string, prefix: string) => {
+        if (path.endsWith('.wasm')) return '/wasm/zxing_reader.wasm';
+        return prefix + path;
+    }
+});
+
 // Native BarcodeDetector is browser-provided (Chrome / Edge / Android WebView).
-// We deliberately do NOT use the `barcode-detector` polyfill: its WASM payload
-// is loaded from a jsDelivr CDN by default, which would break offline kiosks.
-// On browsers without native support we fall back to jsQR (pure JS, bundled).
+// On browsers without native support we now fall back to the ZXing-WASM
+// polyfill (configured above) — much better at tilt, rotation, and glare than
+// jsQR — and finally to bundled jsQR as a last resort.
 declare global {
     interface Window {
         BarcodeDetector?: {
@@ -152,13 +170,30 @@ export default function useScanner(props: IUseScannerProps) {
     }, [pauseDecoding]);
 
     useEffect(() => {
-        if (typeof window !== 'undefined' && window.BarcodeDetector) {
+        if (typeof window === 'undefined') {
+            nativeDetectorRef.current = null;
+            return;
+        }
+        // Prefer native (zero overhead, hardware accelerated when available).
+        if (window.BarcodeDetector) {
             try {
                 nativeDetectorRef.current = new window.BarcodeDetector({ formats });
+                // eslint-disable-next-line no-console
+                console.log('[QR-fork] using native window.BarcodeDetector');
+                return;
             } catch {
-                nativeDetectorRef.current = null;
+                // Fall through to polyfill.
             }
-        } else {
+        }
+        // Polyfill (ZXing-WASM) — ~5ms per detect once warm, far more
+        // robust on tilted / partial / glare-affected QRs than jsQR.
+        try {
+            nativeDetectorRef.current = new PolyfillBarcodeDetector({ formats }) as unknown as InstanceType<NonNullable<Window['BarcodeDetector']>>;
+            // eslint-disable-next-line no-console
+            console.log('[QR-fork] using ZXing-WASM polyfill BarcodeDetector');
+        } catch (err) {
+            // eslint-disable-next-line no-console
+            console.log('[QR-fork] polyfill BarcodeDetector failed to init', err);
             nativeDetectorRef.current = null;
         }
     }, [formats]);
