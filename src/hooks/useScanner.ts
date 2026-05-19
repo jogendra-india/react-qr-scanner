@@ -42,7 +42,11 @@ const HIGH_LUM_FRAMES_TO_DISENGAGE = 30;
 // jsQR has a small but non-zero false-positive rate on cluttered backgrounds
 // (logos, posters, brick walls). Requiring N consecutive identical decodes
 // before reporting eliminates almost all of these at ~16ms*N latency cost.
-const JSQR_CONFIRM_FRAMES = 2;
+// Kiosk consumer (attendance staff_no lookup) validates the decoded value
+// against its staff list, so a phantom decode that doesn't match a real
+// staff number is rejected at the consumer with no side effects. We trade
+// one frame of confirmation latency for catching brief QR presentations.
+const JSQR_CONFIRM_FRAMES = 1;
 // Reject extremely short payloads — a real attendance QR is at least this long.
 // Tune in consumer instead of here if it ever needs to be stricter / looser.
 const MIN_PAYLOAD_LEN = 3;
@@ -109,7 +113,11 @@ export default function useScanner(props: IUseScannerProps) {
         formats = ['qr_code'],
         allowMultiple = false,
         sound = true,
-        roi = 0.7,
+        // Full frame by default. The 0.7 center-crop helps in cluttered
+        // environments but causes valid QRs held near the edge of the
+        // viewfinder to be missed entirely on kiosks. Consumer can lower
+        // the value back if they need the tighter SNR window.
+        roi = 1.0,
         autoTorch = true
     }: IUseScannerProps = props;
 
