@@ -24,6 +24,28 @@ setZXingModuleOverrides({
     }
 });
 
+// Pre-warm the ZXing-WASM module at import time so the very first scan
+// does not eat the WASM compile + engine-init cost (~10ms first call,
+// <2ms subsequent). detect() is the cheapest call that triggers the
+// internal lazy load; running it on a 16x16 throwaway canvas is enough.
+// Errors are swallowed — if pre-warm fails the regular scan path will
+// retry, and we do not want module init to throw and break the app.
+if (typeof document !== 'undefined') {
+    (async () => {
+        try {
+            const warmCanvas = document.createElement('canvas');
+            warmCanvas.width = 16;
+            warmCanvas.height = 16;
+            const warmDetector = new PolyfillBarcodeDetector({ formats: ['qr_code'] });
+            await warmDetector.detect(warmCanvas);
+            // eslint-disable-next-line no-console
+            console.log('[QR-fork] ZXing-WASM pre-warmed');
+        } catch {
+            // best-effort
+        }
+    })();
+}
+
 // Native BarcodeDetector is browser-provided (Chrome / Edge / Android WebView).
 // On browsers without native support we now fall back to the ZXing-WASM
 // polyfill (configured above) — much better at tilt, rotation, and glare than
@@ -162,6 +184,17 @@ export default function useScanner(props: IUseScannerProps) {
     const jsqrLastValueRef = useRef<string | null>(null);
     const jsqrStreakRef = useRef(0);
 
+    // Stuck-fallback gate. ZXing handles 99% of cases on its own and runs
+    // ~10ms per frame, so we want every frame to be a ZXing attempt (decoder
+    // saturates rAF at ~60fps). When ZXing misses ZXING_MISS_BEFORE_JSQR
+    // frames in a row (~80ms of no detection while the user is presenting a
+    // QR) we additionally run the jsQR passes as a second-opinion catch.
+    // jsQR sometimes catches edge cases ZXing does not (different finder
+    // pattern walk) at the cost of ~45ms per frame, so we limit it to the
+    // stuck path only and pay the cost just when we are clearly missing.
+    const zxingMissStreakRef = useRef(0);
+    const ZXING_MISS_BEFORE_JSQR = 5;
+
     // Ref-mirrored pauseDecoding so the long-lived rAF chain reads the
     // latest value without rebuilding the loop on every toggle.
     const pauseDecodingRef = useRef(pauseDecoding);
@@ -274,26 +307,34 @@ export default function useScanner(props: IUseScannerProps) {
 
     const decodeMultiPass = useCallback(
         async (videoEl: HTMLVideoElement): Promise<IDetectedBarcode[]> => {
-            // Pass 1: native BarcodeDetector on the live video element. Hardware
-            // accelerated when available, no CPU readback. Skipped entirely if
-            // the browser lacks native support — we never fall back to a polyfill
-            // that fetches WASM from a CDN.
+            // Pass 1: native BarcodeDetector (window-provided) or ZXing-WASM
+            // polyfill via the same detect() interface. Both decode the live
+            // video element directly with no CPU readback. ZXing handles
+            // the vast majority of tilt / rotation / glare cases on its own.
             const native = nativeDetectorRef.current;
             const passStart = performance.now();
+            let nativeMissed = false;
             if (native) {
                 const nativeStart = performance.now();
                 try {
                     const hits = await native.detect(videoEl);
                     const nativeMs = performance.now() - nativeStart;
                     if (hits.length > 0) {
+                        // Reset both miss streaks so the next ZXing miss does not
+                        // immediately trigger the stuck-fallback path.
+                        zxingMissStreakRef.current = 0;
                         // eslint-disable-next-line no-console
                         console.log(`[QR-fork] BarcodeDetector HIT in ${nativeMs.toFixed(1)}ms value="${hits[0].rawValue}" (video ${videoEl.videoWidth}x${videoEl.videoHeight})`);
                         return hits;
                     }
+                    nativeMissed = true;
+                    zxingMissStreakRef.current++;
                     // eslint-disable-next-line no-console
-                    console.log(`[QR-fork] BarcodeDetector miss in ${nativeMs.toFixed(1)}ms (video ${videoEl.videoWidth}x${videoEl.videoHeight}) -> jsQR fallback`);
+                    console.log(`[QR-fork] BarcodeDetector miss in ${nativeMs.toFixed(1)}ms (video ${videoEl.videoWidth}x${videoEl.videoHeight}) streak=${zxingMissStreakRef.current}`);
                 } catch (err) {
                     const nativeMs = performance.now() - nativeStart;
+                    nativeMissed = true;
+                    zxingMissStreakRef.current++;
                     // eslint-disable-next-line no-console
                     console.log(`[QR-fork] BarcodeDetector threw in ${nativeMs.toFixed(1)}ms`, err);
                     // detect() occasionally throws on torn frames; ignore and continue.
@@ -303,8 +344,20 @@ export default function useScanner(props: IUseScannerProps) {
                 console.log('[QR-fork] BarcodeDetector unavailable -> jsQR fallback only');
             }
 
-            // Pass 2..3: jsQR on a preprocessed greyscale frame. Pure JS, bundled,
-            // works offline. Inversion attempts handle white-on-dark codes.
+            // When ZXing is the active path, the per-frame jsQR work is the
+            // dominant cost (~45ms). Skip it on every ZXing miss and only run
+            // it once the miss streak is long enough that ZXing is clearly
+            // failing on this particular QR/lighting. This lets the decoder
+            // run at near rAF cadence on the common path while still keeping
+            // jsQR as a second-opinion catch when we are stuck.
+            if (native && nativeMissed && zxingMissStreakRef.current < ZXING_MISS_BEFORE_JSQR) {
+                return [];
+            }
+
+            // Pass 2..3: jsQR on a preprocessed greyscale frame. Pure JS,
+            // bundled, works offline. Inversion attempts handle white-on-dark
+            // codes. Hit here is logged with the ZXing miss streak that
+            // unlocked it for diagnostics.
             const grabStart = performance.now();
             const frame = grabFrame(videoEl);
             const grabMs = performance.now() - grabStart;
@@ -379,8 +432,12 @@ export default function useScanner(props: IUseScannerProps) {
                 return [];
             }
 
+            // Successful jsQR hit through the stuck-fallback path: reset the
+            // ZXing miss streak so we go back to ZXing-only decoding next
+            // frame and do not keep paying the jsQR cost.
+            zxingMissStreakRef.current = 0;
             // eslint-disable-next-line no-console
-            console.log(`[QR-fork] decode total ${totalMs.toFixed(1)}ms FIRE value="${value}"`);
+            console.log(`[QR-fork] decode total ${totalMs.toFixed(1)}ms FIRE value="${value}" (via jsQR stuck-fallback)`);
             return [buildBarcode(value)];
         },
         [grabFrame, updateAutoTorch]
@@ -497,6 +554,7 @@ export default function useScanner(props: IUseScannerProps) {
         highLumStreakRef.current = 0;
         jsqrLastValueRef.current = null;
         jsqrStreakRef.current = 0;
+        zxingMissStreakRef.current = 0;
     }, [onAutoTorch]);
 
     return {
