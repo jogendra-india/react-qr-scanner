@@ -22,6 +22,10 @@ export interface IScannerProps {
     constraints?: MediaTrackConstraints;
     formats?: BarcodeFormat[];
     paused?: boolean;
+    // Suspend QR decoding without releasing the camera. Use when the
+    // consumer needs the live video feed (face recognition, preview UI)
+    // but does not want jsQR / BarcodeDetector chewing CPU per frame.
+    pauseDecoding?: boolean;
     children?: ReactNode;
     components?: IScannerComponents;
     styles?: IScannerStyles;
@@ -130,6 +134,7 @@ export function Scanner(props: IScannerProps) {
         constraints,
         formats = ['qr_code'],
         paused = false,
+        pauseDecoding = false,
         components,
         children,
         styles,
@@ -179,7 +184,8 @@ export function Scanner(props: IScannerProps) {
         retryDelay: 0,
         scanDelay: scanDelay,
         allowMultiple: allowMultiple,
-        sound: sound
+        sound: sound,
+        pauseDecoding: pauseDecoding
     });
 
     useEffect(() => {

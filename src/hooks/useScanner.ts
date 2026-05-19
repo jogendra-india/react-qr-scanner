@@ -33,6 +33,12 @@ interface IUseScannerProps {
     scanDelay?: number;
     roi?: number;
     autoTorch?: boolean;
+    // When true, the rAF loop keeps spinning (so the consumer can resume
+    // instantly) but the per-frame decode is skipped. Camera stays live.
+    // Use this while the consumer is busy with downstream work that needs
+    // CPU and the live video stream (e.g. face recognition) but should not
+    // be interrupted by a fresh QR callback.
+    pauseDecoding?: boolean;
 }
 
 const LOW_LUMINANCE = 70;
@@ -118,7 +124,8 @@ export default function useScanner(props: IUseScannerProps) {
         // viewfinder to be missed entirely on kiosks. Consumer can lower
         // the value back if they need the tighter SNR window.
         roi = 1.0,
-        autoTorch = true
+        autoTorch = true,
+        pauseDecoding = false
     }: IUseScannerProps = props;
 
     const nativeDetectorRef = useRef<InstanceType<NonNullable<Window['BarcodeDetector']>> | null>(null);
@@ -136,6 +143,13 @@ export default function useScanner(props: IUseScannerProps) {
     // jsQR confirmation buffer — last decode value and streak count.
     const jsqrLastValueRef = useRef<string | null>(null);
     const jsqrStreakRef = useRef(0);
+
+    // Ref-mirrored pauseDecoding so the long-lived rAF chain reads the
+    // latest value without rebuilding the loop on every toggle.
+    const pauseDecodingRef = useRef(pauseDecoding);
+    useEffect(() => {
+        pauseDecodingRef.current = pauseDecoding;
+    }, [pauseDecoding]);
 
     useEffect(() => {
         if (typeof window !== 'undefined' && window.BarcodeDetector) {
@@ -357,6 +371,15 @@ export default function useScanner(props: IUseScannerProps) {
             if (decodeInFlightRef.current) {
                 // eslint-disable-next-line no-console
                 console.log('[QR-fork] frame skip: decode in flight');
+                animationFrameIdRef.current = window.requestAnimationFrame(processFrame(state));
+                return;
+            }
+
+            if (pauseDecodingRef.current) {
+                // Reset the jsQR confirmation streak while paused so that a
+                // resume on the SAME stale code does not immediately fire.
+                jsqrLastValueRef.current = null;
+                jsqrStreakRef.current = 0;
                 animationFrameIdRef.current = window.requestAnimationFrame(processFrame(state));
                 return;
             }

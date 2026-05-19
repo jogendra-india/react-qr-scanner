@@ -24,6 +24,7 @@ interface IUseScannerProps {
     scanDelay?: number;
     roi?: number;
     autoTorch?: boolean;
+    pauseDecoding?: boolean;
 }
 export default function useScanner(props: IUseScannerProps): {
     startScanning: () => void;

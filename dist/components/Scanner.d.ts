@@ -6,6 +6,7 @@ export interface IScannerProps {
     constraints?: MediaTrackConstraints;
     formats?: BarcodeFormat[];
     paused?: boolean;
+    pauseDecoding?: boolean;
     children?: ReactNode;
     components?: IScannerComponents;
     styles?: IScannerStyles;
