@@ -212,6 +212,13 @@ export default function useScanner(props: IUseScannerProps) {
         pauseDecodingRef.current = pauseDecoding;
     }, [pauseDecoding]);
 
+    // Stable cache key for formats so the detector init effect only
+    // re-fires when the actual formats list changes, not when the parent
+    // re-renders with a fresh array literal. Without this the consumer
+    // saw "using ZXing-WASM polyfill BarcodeDetector" logged on every
+    // render — harmless but noisy in production console logs.
+    const formatsKey = (formats || []).slice().sort().join(',');
+
     useEffect(() => {
         if (typeof window === 'undefined') {
             nativeDetectorRef.current = null;
@@ -239,7 +246,8 @@ export default function useScanner(props: IUseScannerProps) {
             console.log('[QR-fork] polyfill BarcodeDetector failed to init', err);
             nativeDetectorRef.current = null;
         }
-    }, [formats]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [formatsKey]);
 
     useEffect(() => {
         if (typeof window !== 'undefined' && sound) {
@@ -349,8 +357,15 @@ export default function useScanner(props: IUseScannerProps) {
                     }
                     nativeMissed = true;
                     zxingMissStreakRef.current++;
-                    // eslint-disable-next-line no-console
-                    console.log(`[QR-fork] BarcodeDetector miss in ${nativeMs.toFixed(1)}ms (video ${videoEl.videoWidth}x${videoEl.videoHeight}) streak=${zxingMissStreakRef.current}`);
+                    // Only log every 30th miss (and the very first) so the
+                    // console does not flood while ZXing is stuck. The HIT
+                    // path always logs, and the stuck-fallback path below
+                    // has its own jsQR logs, so we keep enough breadcrumbs
+                    // for diagnosis without per-frame noise.
+                    if (zxingMissStreakRef.current === 1 || zxingMissStreakRef.current % 30 === 0) {
+                        // eslint-disable-next-line no-console
+                        console.log(`[QR-fork] BarcodeDetector miss in ${nativeMs.toFixed(1)}ms (video ${videoEl.videoWidth}x${videoEl.videoHeight}) streak=${zxingMissStreakRef.current}`);
+                    }
                 } catch (err) {
                     const nativeMs = performance.now() - nativeStart;
                     nativeMissed = true;
@@ -402,8 +417,6 @@ export default function useScanner(props: IUseScannerProps) {
                 const res = jsQR(imgData.data, frame.width, frame.height, { inversionAttempts: 'attemptBoth' });
                 const ms = performance.now() - t0;
                 if (!res) {
-                    // eslint-disable-next-line no-console
-                    console.log(`[QR-fork] jsQR-${label} miss ${frame.width}x${frame.height} in ${ms.toFixed(1)}ms (luma ${frame.meanLuma.toFixed(0)})`);
                     return null;
                 }
                 const v = res.data;
@@ -437,11 +450,10 @@ export default function useScanner(props: IUseScannerProps) {
 
             const totalMs = performance.now() - passStart;
             if (value === null) {
-                // No hit — reset confirmation streak.
+                // No hit — reset confirmation streak. Silent: ZXing miss
+                // logs already give the per-streak signal.
                 jsqrLastValueRef.current = null;
                 jsqrStreakRef.current = 0;
-                // eslint-disable-next-line no-console
-                console.log(`[QR-fork] decode total ${totalMs.toFixed(1)}ms grabFrame=${grabMs.toFixed(1)}ms NO_HIT`);
                 return [];
             }
 
@@ -455,8 +467,6 @@ export default function useScanner(props: IUseScannerProps) {
             }
 
             if (jsqrStreakRef.current < JSQR_CONFIRM_FRAMES) {
-                // eslint-disable-next-line no-console
-                console.log(`[QR-fork] decode total ${totalMs.toFixed(1)}ms streak=${jsqrStreakRef.current}/${JSQR_CONFIRM_FRAMES} GATED`);
                 return [];
             }
 
@@ -475,8 +485,6 @@ export default function useScanner(props: IUseScannerProps) {
         (state: IUseScannerState) => async (timeNow: number) => {
             const videoEl = videoElementRef.current;
             if (videoEl === null || videoEl.readyState <= 1) {
-                // eslint-disable-next-line no-console
-                console.log(`[QR-fork] frame skip: video not ready (readyState=${videoEl ? videoEl.readyState : 'null'})`);
                 animationFrameIdRef.current = window.requestAnimationFrame(processFrame(state));
                 return;
             }
@@ -489,8 +497,6 @@ export default function useScanner(props: IUseScannerProps) {
             }
 
             if (decodeInFlightRef.current) {
-                // eslint-disable-next-line no-console
-                console.log('[QR-fork] frame skip: decode in flight');
                 animationFrameIdRef.current = window.requestAnimationFrame(processFrame(state));
                 return;
             }
@@ -504,19 +510,12 @@ export default function useScanner(props: IUseScannerProps) {
                 return;
             }
 
-            const sinceLast = timeNow - lastScan;
             decodeInFlightRef.current = true;
             let detectedCodes: IDetectedBarcode[] = [];
-            const decodeStart = performance.now();
             try {
                 detectedCodes = await decodeMultiPass(videoEl);
             } finally {
                 decodeInFlightRef.current = false;
-            }
-            const decodeWallMs = performance.now() - decodeStart;
-            if (decodeWallMs > 50) {
-                // eslint-disable-next-line no-console
-                console.log(`[QR-fork] frame decode wall=${decodeWallMs.toFixed(1)}ms gap-since-prev=${sinceLast.toFixed(1)}ms hits=${detectedCodes.length}`);
             }
 
             const anyNewCodesDetected = detectedCodes.some((code) => !contentBefore.includes(code.rawValue));
