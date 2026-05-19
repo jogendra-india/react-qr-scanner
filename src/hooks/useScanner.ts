@@ -97,28 +97,6 @@ const JSQR_CONFIRM_FRAMES = 1;
 // Tune in consumer instead of here if it ever needs to be stricter / looser.
 const MIN_PAYLOAD_LEN = 3;
 
-type JsQrResult = NonNullable<ReturnType<typeof jsQR>>;
-
-function makeBoundingBoxFromLocation(loc: JsQrResult): DOMRectReadOnly {
-    const xs = [
-        loc.location.topLeftCorner.x,
-        loc.location.topRightCorner.x,
-        loc.location.bottomLeftCorner.x,
-        loc.location.bottomRightCorner.x
-    ];
-    const ys = [
-        loc.location.topLeftCorner.y,
-        loc.location.topRightCorner.y,
-        loc.location.bottomLeftCorner.y,
-        loc.location.bottomRightCorner.y
-    ];
-    const x = Math.min(...xs);
-    const y = Math.min(...ys);
-    const width = Math.max(...xs) - x;
-    const height = Math.max(...ys) - y;
-    return DOMRectReadOnly.fromRect({ x, y, width, height });
-}
-
 function contrastStretch(gray: Uint8ClampedArray): Uint8ClampedArray {
     let min = 255;
     let max = 0;
@@ -340,43 +318,29 @@ export default function useScanner(props: IUseScannerProps) {
             // video element directly with no CPU readback. ZXing handles
             // the vast majority of tilt / rotation / glare cases on its own.
             const native = nativeDetectorRef.current;
-            const passStart = performance.now();
             let nativeMissed = false;
             if (native) {
-                const nativeStart = performance.now();
                 try {
                     const hits = await native.detect(videoEl);
-                    const nativeMs = performance.now() - nativeStart;
                     if (hits.length > 0) {
                         // Reset both miss streaks so the next ZXing miss does not
                         // immediately trigger the stuck-fallback path.
                         zxingMissStreakRef.current = 0;
-                        // eslint-disable-next-line no-console
-                        console.log(`[QR-fork] BarcodeDetector HIT in ${nativeMs.toFixed(1)}ms value="${hits[0].rawValue}" (video ${videoEl.videoWidth}x${videoEl.videoHeight})`);
                         return hits;
                     }
                     nativeMissed = true;
                     zxingMissStreakRef.current++;
-                    // Only log every 30th miss (and the very first) so the
-                    // console does not flood while ZXing is stuck. The HIT
-                    // path always logs, and the stuck-fallback path below
-                    // has its own jsQR logs, so we keep enough breadcrumbs
-                    // for diagnosis without per-frame noise.
-                    if (zxingMissStreakRef.current === 1 || zxingMissStreakRef.current % 30 === 0) {
-                        // eslint-disable-next-line no-console
-                        console.log(`[QR-fork] BarcodeDetector miss in ${nativeMs.toFixed(1)}ms (video ${videoEl.videoWidth}x${videoEl.videoHeight}) streak=${zxingMissStreakRef.current}`);
-                    }
                 } catch (err) {
-                    const nativeMs = performance.now() - nativeStart;
                     nativeMissed = true;
                     zxingMissStreakRef.current++;
-                    // eslint-disable-next-line no-console
-                    console.log(`[QR-fork] BarcodeDetector threw in ${nativeMs.toFixed(1)}ms`, err);
-                    // detect() occasionally throws on torn frames; ignore and continue.
+                    // detect() occasionally throws on torn frames; ignore and
+                    // log only the very first occurrence per session so the
+                    // breadcrumb stays without per-frame noise.
+                    if (zxingMissStreakRef.current === 1) {
+                        // eslint-disable-next-line no-console
+                        console.log('[QR-fork] BarcodeDetector threw', err);
+                    }
                 }
-            } else {
-                // eslint-disable-next-line no-console
-                console.log('[QR-fork] BarcodeDetector unavailable -> jsQR fallback only');
             }
 
             // When ZXing is the active path, the per-frame jsQR work is the
@@ -399,34 +363,19 @@ export default function useScanner(props: IUseScannerProps) {
 
             // Pass 2..3: jsQR on a preprocessed greyscale frame. Pure JS,
             // bundled, works offline. Inversion attempts handle white-on-dark
-            // codes. Hit here is logged with the ZXing miss streak that
-            // unlocked it for diagnostics.
-            const grabStart = performance.now();
+            // codes.
             const frame = grabFrame(videoEl);
-            const grabMs = performance.now() - grabStart;
             if (!frame) {
-                // eslint-disable-next-line no-console
-                console.log(`[QR-fork] grabFrame returned null in ${grabMs.toFixed(1)}ms`);
                 return [];
             }
             updateAutoTorch(frame.meanLuma);
 
-            const tryJsQr = (gray: Uint8ClampedArray, label: string): string | null => {
-                const t0 = performance.now();
+            const tryJsQr = (gray: Uint8ClampedArray): string | null => {
                 const imgData = grayToImageData(gray, frame.width, frame.height);
                 const res = jsQR(imgData.data, frame.width, frame.height, { inversionAttempts: 'attemptBoth' });
-                const ms = performance.now() - t0;
-                if (!res) {
-                    return null;
-                }
+                if (!res) return null;
                 const v = res.data;
-                if (!v || v.length < MIN_PAYLOAD_LEN) {
-                    // eslint-disable-next-line no-console
-                    console.log(`[QR-fork] jsQR-${label} too short "${v}" len=${v ? v.length : 0} in ${ms.toFixed(1)}ms`);
-                    return null;
-                }
-                // eslint-disable-next-line no-console
-                console.log(`[QR-fork] jsQR-${label} HIT "${v}" ${frame.width}x${frame.height} in ${ms.toFixed(1)}ms`);
+                if (!v || v.length < MIN_PAYLOAD_LEN) return null;
                 return v;
             };
 
@@ -442,16 +391,14 @@ export default function useScanner(props: IUseScannerProps) {
                 cornerPoints: []
             });
 
-            let value = tryJsQr(frame.gray, 'gray');
+            let value = tryJsQr(frame.gray);
             if (!value) {
                 const stretched = contrastStretch(frame.gray);
-                value = tryJsQr(stretched, 'stretched');
+                value = tryJsQr(stretched);
             }
 
-            const totalMs = performance.now() - passStart;
             if (value === null) {
-                // No hit — reset confirmation streak. Silent: ZXing miss
-                // logs already give the per-streak signal.
+                // No hit — reset confirmation streak.
                 jsqrLastValueRef.current = null;
                 jsqrStreakRef.current = 0;
                 return [];
@@ -470,12 +417,13 @@ export default function useScanner(props: IUseScannerProps) {
                 return [];
             }
 
-            // Successful jsQR hit through the stuck-fallback path: reset the
-            // ZXing miss streak so we go back to ZXing-only decoding next
-            // frame and do not keep paying the jsQR cost.
+            // Successful jsQR hit through the stuck-fallback path. Reset the
+            // ZXing miss streak so the next frame goes back to ZXing-only
+            // decoding and stops paying the jsQR cost. Log only this event
+            // (rare in practice) since it signals that ZXing was stuck.
             zxingMissStreakRef.current = 0;
             // eslint-disable-next-line no-console
-            console.log(`[QR-fork] decode total ${totalMs.toFixed(1)}ms FIRE value="${value}" (via jsQR stuck-fallback)`);
+            console.log(`[QR-fork] jsQR stuck-fallback FIRE value="${value}"`);
             return [buildBarcode(value)];
         },
         [grabFrame, updateAutoTorch]
