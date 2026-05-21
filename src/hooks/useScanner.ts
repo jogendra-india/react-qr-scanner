@@ -11,6 +11,28 @@ import { IDetectedBarcode, IUseScannerState, BarcodeFormat } from '../types';
 
 import { base64Beep } from '../assets/base64Beep';
 
+// localStorage-gated diagnostic logger. Mirrors the consumer's debugUtils
+// pattern (`localStorage.setItem('debug', 'true')`) so the same toggle that
+// enables app-side `debugLog` also enables per-frame fork logs. Cheap on the
+// hot path: a single localStorage read per log call when off — and the gate
+// is read inside the helper, so a debugLog() call adds zero overhead when
+// debug is disabled beyond the localStorage read.
+function isQRDebugEnabled(): boolean {
+    try {
+        if (typeof window === 'undefined') return false;
+        const v = window.localStorage?.getItem('debug');
+        return String(v).toLowerCase() === 'true';
+    } catch {
+        return false;
+    }
+}
+function qrDebugLog(...args: unknown[]): void {
+    if (isQRDebugEnabled()) {
+        // eslint-disable-next-line no-console
+        console.log('[QR-fork]', ...args);
+    }
+}
+
 // ZXing-WASM polyfill (used when native window.BarcodeDetector is missing —
 // kiosk Chromium builds typically lack it). The WASM file ships with the
 // consumer at /wasm/zxing_reader.wasm so nothing is ever fetched from a CDN.
@@ -415,6 +437,7 @@ export default function useScanner(props: IUseScannerProps) {
                 highLumStreakRef.current = 0;
                 if (!torchEngagedRef.current && lowLumStreakRef.current >= LOW_LUM_FRAMES_TO_ENGAGE) {
                     torchEngagedRef.current = true;
+                    qrDebugLog(`torch ENGAGE meanLuma=${meanLuma.toFixed(0)} after ${lowLumStreakRef.current} low-lum frames`);
                     onAutoTorch(true);
                 }
             } else if (meanLuma > HIGH_LUMINANCE) {
@@ -422,6 +445,7 @@ export default function useScanner(props: IUseScannerProps) {
                 lowLumStreakRef.current = 0;
                 if (torchEngagedRef.current && highLumStreakRef.current >= HIGH_LUM_FRAMES_TO_DISENGAGE) {
                     torchEngagedRef.current = false;
+                    qrDebugLog(`torch DISENGAGE meanLuma=${meanLuma.toFixed(0)} after ${highLumStreakRef.current} high-lum frames`);
                     onAutoTorch(false);
                 }
             } else {
@@ -441,16 +465,19 @@ export default function useScanner(props: IUseScannerProps) {
             const native = nativeDetectorRef.current;
             let nativeMissed = false;
             if (native) {
+                const t0 = performance.now();
                 try {
                     const hits = await native.detect(videoEl);
                     if (hits.length > 0) {
                         // Reset both miss streaks so the next ZXing miss does not
                         // immediately trigger the stuck-fallback path.
                         zxingMissStreakRef.current = 0;
+                        qrDebugLog(`ZXing HIT t=${(performance.now() - t0).toFixed(1)}ms value="${hits[0].rawValue}"`);
                         return hits;
                     }
                     nativeMissed = true;
                     zxingMissStreakRef.current++;
+                    qrDebugLog(`ZXing miss t=${(performance.now() - t0).toFixed(1)}ms streak=${zxingMissStreakRef.current}`);
                 } catch (err) {
                     nativeMissed = true;
                     zxingMissStreakRef.current++;
@@ -458,6 +485,7 @@ export default function useScanner(props: IUseScannerProps) {
                         // eslint-disable-next-line no-console
                         console.log('[QR-fork] BarcodeDetector threw', err);
                     }
+                    qrDebugLog(`ZXing throw t=${(performance.now() - t0).toFixed(1)}ms streak=${zxingMissStreakRef.current}`);
                 }
             }
 
@@ -471,9 +499,11 @@ export default function useScanner(props: IUseScannerProps) {
                 }
                 const nowTs = performance.now();
                 if (nowTs - lastJsqrAttemptAtRef.current < JSQR_MIN_INTERVAL_MS) {
+                    qrDebugLog(`jsQR rate-limited (since-last=${(nowTs - lastJsqrAttemptAtRef.current).toFixed(0)}ms < ${JSQR_MIN_INTERVAL_MS}ms)`);
                     return [];
                 }
                 lastJsqrAttemptAtRef.current = nowTs;
+                qrDebugLog(`jsQR unlocked: streak=${zxingMissStreakRef.current} starting multi-scale pass`);
             }
 
             // Multi-scale jsQR. Pyzbar-style: try the same frame at three
@@ -488,6 +518,9 @@ export default function useScanner(props: IUseScannerProps) {
             // catch both light-on-dark and dark-on-light codes.
             let value: string | null = null;
             let lumaUpdated = false;
+            let hitScale: number | null = null;
+            let hitVariant: string | null = null;
+            const jsqrT0 = performance.now();
 
             for (const maxDim of JSQR_SCALES) {
                 const frame = grabFrame(videoEl, maxDim);
@@ -496,6 +529,7 @@ export default function useScanner(props: IUseScannerProps) {
                 if (!lumaUpdated) {
                     updateAutoTorch(frame.meanLuma);
                     lumaUpdated = true;
+                    qrDebugLog(`jsQR frame ${frame.width}x${frame.height} meanLuma=${frame.meanLuma.toFixed(0)} torch=${torchEngagedRef.current}`);
                 }
 
                 const tryDecode = (buf: Uint8ClampedArray): string | null => {
@@ -508,13 +542,18 @@ export default function useScanner(props: IUseScannerProps) {
                 };
 
                 value = tryDecode(frame.gray);
-                if (!value) {
-                    value = tryDecode(contrastStretch(frame.gray));
-                }
-                if (!value) {
-                    value = tryDecode(sauvolaThreshold(frame.gray, frame.width, frame.height));
-                }
-                if (value) break;
+                if (value) { hitScale = maxDim; hitVariant = 'raw'; break; }
+                value = tryDecode(contrastStretch(frame.gray));
+                if (value) { hitScale = maxDim; hitVariant = 'stretch'; break; }
+                value = tryDecode(sauvolaThreshold(frame.gray, frame.width, frame.height));
+                if (value) { hitScale = maxDim; hitVariant = 'sauvola'; break; }
+            }
+
+            const jsqrTotal = (performance.now() - jsqrT0).toFixed(1);
+            if (value) {
+                qrDebugLog(`jsQR HIT scale=${hitScale} variant=${hitVariant} t=${jsqrTotal}ms value="${value}"`);
+            } else {
+                qrDebugLog(`jsQR miss all-scales t=${jsqrTotal}ms`);
             }
 
             const buildBarcode = (rawValue: string): IDetectedBarcode => ({
@@ -564,13 +603,22 @@ export default function useScanner(props: IUseScannerProps) {
     // supported — it fires on actual new video frames, so we never burn CPU
     // re-decoding an unchanged frame the way rAF does when the camera runs
     // at <60fps. Falls back to rAF on Firefox <130 / older browsers.
+    const schedulerKindLoggedRef = useRef(false);
     const scheduleNext = useCallback(
         (cb: (now: number) => void) => {
             const videoEl = videoElementRef.current;
             if (videoEl && typeof videoEl.requestVideoFrameCallback === 'function') {
+                if (!schedulerKindLoggedRef.current) {
+                    schedulerKindLoggedRef.current = true;
+                    qrDebugLog('scheduler: requestVideoFrameCallback (rVFC)');
+                }
                 const id = videoEl.requestVideoFrameCallback((now: number) => cb(now));
                 scheduleHandleRef.current = { type: 'rvfc', id };
             } else {
+                if (!schedulerKindLoggedRef.current) {
+                    schedulerKindLoggedRef.current = true;
+                    qrDebugLog('scheduler: requestAnimationFrame (rAF fallback)');
+                }
                 const id = window.requestAnimationFrame(cb);
                 scheduleHandleRef.current = { type: 'raf', id };
             }
@@ -613,6 +661,9 @@ export default function useScanner(props: IUseScannerProps) {
             if (pauseDecodingRef.current) {
                 // Reset the jsQR confirmation streak while paused so that a
                 // resume on the SAME stale code does not immediately fire.
+                if (jsqrLastValueRef.current !== null || jsqrStreakRef.current !== 0) {
+                    qrDebugLog('pauseDecoding entered; clearing jsQR confirmation streak');
+                }
                 jsqrLastValueRef.current = null;
                 jsqrStreakRef.current = 0;
                 scheduleNext(processFrame(state));
@@ -661,6 +712,7 @@ export default function useScanner(props: IUseScannerProps) {
     );
 
     const startScanning = useCallback(() => {
+        qrDebugLog('startScanning() called — decode loop arming');
         const current = performance.now();
         const initialState: IUseScannerState = {
             lastScan: current,
@@ -672,6 +724,7 @@ export default function useScanner(props: IUseScannerProps) {
     }, [processFrame, scheduleNext]);
 
     const stopScanning = useCallback(() => {
+        qrDebugLog('stopScanning() called — cancelling decode loop');
         cancelScheduled();
         // Physically disengage torch if we turned it on. Downstream face
         // recognition needs the camera with no LED flooding the subject.
