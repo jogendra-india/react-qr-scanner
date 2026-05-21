@@ -4,7 +4,7 @@ import jsQR from 'jsqr';
 
 import {
     BarcodeDetector as PolyfillBarcodeDetector,
-    setZXingModuleOverrides
+    prepareZXingModule
 } from 'barcode-detector/pure';
 
 import { IDetectedBarcode, IUseScannerState, BarcodeFormat } from '../types';
@@ -37,13 +37,25 @@ function qrDebugLog(...args: unknown[]): void {
 // kiosk Chromium builds typically lack it). The WASM file ships with the
 // consumer at /wasm/zxing_reader.wasm so nothing is ever fetched from a CDN.
 // Service workers in the consumer also rewrite any jsdelivr ZXing URL to the
-// same local path as a belt-and-braces guard. The polyfill expects the
-// override to be set BEFORE the first detect() call.
-setZXingModuleOverrides({
-    locateFile: (path: string, prefix: string) => {
-        if (path.endsWith('.wasm')) return '/wasm/zxing_reader.wasm';
-        return prefix + path;
-    }
+// same local path as a belt-and-braces guard.
+//
+// barcode-detector v3.x changed init semantics: setZXingModuleOverrides() only
+// records overrides but does not eagerly compile/instantiate the WASM module.
+// On the first detect() call the polyfill auto-loads — but under certain build
+// permutations the lazy load can end up in a half-initialised state where a
+// required export (e.g. memory-table function) is missing, producing the
+// cryptic "TypeError: Ft.Ba is not a function" / "Barcode detection service
+// unavailable" pair on every detect(). prepareZXingModule({..., fireImmediately:
+// true}) forces a full compile + instantiate with our overrides applied so the
+// module is fully ready before any detect() call.
+prepareZXingModule({
+    overrides: {
+        locateFile: (path: string, prefix: string) => {
+            if (path.endsWith('.wasm')) return '/wasm/zxing_reader.wasm';
+            return prefix + path;
+        }
+    },
+    fireImmediately: true
 });
 
 // Pre-warm the ZXing-WASM module so the very first scan does not eat the
@@ -163,6 +175,13 @@ const SAUVOLA_R = 128;
 // 100ms inter-attempt gap keep the per-second budget bounded.
 const ZXING_MISS_BEFORE_JSQR = 2;
 const JSQR_MIN_INTERVAL_MS = 100;
+
+// If the native/polyfill detector throws this many times in a row we treat the
+// detector as broken and stop calling it. The fallback path (jsQR multi-scale)
+// becomes the sole decoder. This avoids the dead-detector hot loop where every
+// frame spends ~15ms throwing, then ~370ms in jsQR — saturating the main
+// thread for nothing.
+const ZXING_THROW_GIVEUP = 5;
 
 function contrastStretch(gray: Uint8ClampedArray): Uint8ClampedArray {
     let min = 255;
@@ -313,6 +332,7 @@ export default function useScanner(props: IUseScannerProps) {
     const jsqrStreakRef = useRef(0);
 
     const zxingMissStreakRef = useRef(0);
+    const zxingThrowStreakRef = useRef(0);
     const lastJsqrAttemptAtRef = useRef(0);
 
     // Ref-mirrored pauseDecoding so the long-lived rAF chain reads the
@@ -472,20 +492,32 @@ export default function useScanner(props: IUseScannerProps) {
                         // Reset both miss streaks so the next ZXing miss does not
                         // immediately trigger the stuck-fallback path.
                         zxingMissStreakRef.current = 0;
+                        zxingThrowStreakRef.current = 0;
                         qrDebugLog(`ZXing HIT t=${(performance.now() - t0).toFixed(1)}ms value="${hits[0].rawValue}"`);
                         return hits;
                     }
                     nativeMissed = true;
                     zxingMissStreakRef.current++;
+                    zxingThrowStreakRef.current = 0;
                     qrDebugLog(`ZXing miss t=${(performance.now() - t0).toFixed(1)}ms streak=${zxingMissStreakRef.current}`);
                 } catch (err) {
                     nativeMissed = true;
                     zxingMissStreakRef.current++;
-                    if (zxingMissStreakRef.current === 1) {
+                    zxingThrowStreakRef.current++;
+                    if (zxingThrowStreakRef.current === 1) {
                         // eslint-disable-next-line no-console
                         console.log('[QR-fork] BarcodeDetector threw', err);
                     }
-                    qrDebugLog(`ZXing throw t=${(performance.now() - t0).toFixed(1)}ms streak=${zxingMissStreakRef.current}`);
+                    qrDebugLog(`ZXing throw t=${(performance.now() - t0).toFixed(1)}ms throwStreak=${zxingThrowStreakRef.current}`);
+                    // If the detector throws repeatedly the polyfill is dead (init
+                    // failure, WASM-API mismatch, etc). Stop hammering it; null out
+                    // the detector so subsequent frames go straight to the jsQR
+                    // multi-scale path without paying the ~15ms throw cost.
+                    if (zxingThrowStreakRef.current >= ZXING_THROW_GIVEUP) {
+                        // eslint-disable-next-line no-console
+                        console.log(`[QR-fork] BarcodeDetector disabled after ${ZXING_THROW_GIVEUP} consecutive throws — jsQR-only from here`);
+                        nativeDetectorRef.current = null;
+                    }
                 }
             }
 
@@ -741,6 +773,7 @@ export default function useScanner(props: IUseScannerProps) {
         jsqrLastValueRef.current = null;
         jsqrStreakRef.current = 0;
         zxingMissStreakRef.current = 0;
+        zxingThrowStreakRef.current = 0;
         lastJsqrAttemptAtRef.current = 0;
     }, [onAutoTorch, cancelScheduled]);
 
