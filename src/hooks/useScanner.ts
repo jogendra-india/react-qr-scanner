@@ -24,15 +24,23 @@ setZXingModuleOverrides({
     }
 });
 
-// Pre-warm the ZXing-WASM module at import time so the very first scan
-// does not eat the WASM compile + engine-init cost (~10ms first call,
-// <2ms subsequent). detect() is the cheapest call that triggers the
-// internal lazy load; running it on a 16x16 throwaway canvas is enough.
-// Errors are swallowed — if pre-warm fails the regular scan path will
-// retry, and we do not want module init to throw and break the app.
+// Pre-warm the ZXing-WASM module so the very first scan does not eat the
+// WASM compile + engine-init cost (~10ms first call, <2ms subsequent).
+// detect() is the cheapest call that triggers the internal lazy load; running
+// it on a 16x16 throwaway canvas is enough. We wait briefly for the consumer
+// service worker to take control so the WASM fetch hits the SW cache (offline
+// kiosk path) rather than racing the network. Errors are swallowed.
 if (typeof document !== 'undefined') {
     (async () => {
         try {
+            if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator && !navigator.serviceWorker.controller) {
+                await Promise.race([
+                    new Promise<void>((resolve) => {
+                        navigator.serviceWorker.addEventListener('controllerchange', () => resolve(), { once: true });
+                    }),
+                    new Promise<void>((resolve) => setTimeout(resolve, 500))
+                ]);
+            }
             const warmCanvas = document.createElement('canvas');
             warmCanvas.width = 16;
             warmCanvas.height = 16;
@@ -60,6 +68,10 @@ declare global {
         };
     }
 }
+// requestVideoFrameCallback / cancelVideoFrameCallback are declared in
+// lib.dom.d.ts on TypeScript >= 4.4. We feature-detect at runtime so we
+// don't need to declare them here; older browsers (Firefox <130, Safari
+// <16) simply fall back to requestAnimationFrame.
 
 interface IUseScannerProps {
     videoElementRef: RefObject<HTMLVideoElement | null>;
@@ -73,17 +85,20 @@ interface IUseScannerProps {
     scanDelay?: number;
     roi?: number;
     autoTorch?: boolean;
-    // When true, the rAF loop keeps spinning (so the consumer can resume
-    // instantly) but the per-frame decode is skipped. Camera stays live.
-    // Use this while the consumer is busy with downstream work that needs
-    // CPU and the live video stream (e.g. face recognition) but should not
-    // be interrupted by a fresh QR callback.
+    // When true, the rAF/rVFC loop keeps spinning (so the consumer can
+    // resume instantly) but the per-frame decode is skipped. Camera stays
+    // live. Use this while the consumer is busy with downstream work that
+    // needs CPU and the live video stream (e.g. face recognition) but
+    // should not be interrupted by a fresh QR callback.
     pauseDecoding?: boolean;
 }
 
 const LOW_LUMINANCE = 70;
 const HIGH_LUMINANCE = 160;
-const LOW_LUM_FRAMES_TO_ENGAGE = 20;
+// Aggressive torch engagement — was 20 frames (~330ms), dropping to 8 (~130ms)
+// so dim presentations get assistance fast. Disengage stays slow so we do not
+// flap on/off during a single decode attempt.
+const LOW_LUM_FRAMES_TO_ENGAGE = 8;
 const HIGH_LUM_FRAMES_TO_DISENGAGE = 30;
 // jsQR has a small but non-zero false-positive rate on cluttered backgrounds
 // (logos, posters, brick walls). Requiring N consecutive identical decodes
@@ -97,10 +112,40 @@ const JSQR_CONFIRM_FRAMES = 1;
 // Tune in consumer instead of here if it ever needs to be stricter / looser.
 const MIN_PAYLOAD_LEN = 3;
 
+// Multi-scale jsQR (pyzbar-style). Each scale is the *longest-edge* target
+// after downsampling the ROI crop. Pyzbar gets robustness from trying the
+// finder-pattern walk at multiple module sizes — we approximate that by
+// re-running jsQR at three resolutions. First hit wins. Larger scales help
+// distant / small QRs (more modules survive); smaller scales help motion-
+// blurred or low-contrast QRs (averaging hides noise).
+const JSQR_SCALES = [640, 480, 320];
+
+// Sauvola adaptive-threshold parameters. Pyzbar / OpenCV typically use 15px
+// windows with k≈0.34, R=128. The window is intentionally larger than a
+// typical QR module so local mean+std are stable across the finder pattern
+// instead of inside it.
+const SAUVOLA_WINDOW = 15;
+const SAUVOLA_K = 0.34;
+const SAUVOLA_R = 128;
+
+// Gating: when ZXing is the active path, the per-frame jsQR work is the
+// dominant cost (even after downsampling — still ~25ms per scale). Two
+// gates: (a) miss streak must reach ZXING_MISS_BEFORE_JSQR before jsQR is
+// allowed to run at all, and (b) once unlocked jsQR runs at most once per
+// JSQR_MIN_INTERVAL_MS so ZXing keeps ticking at near-rAF cadence between
+// attempts.
+//
+// Previous values (5 / 200) were too defensive — a user waving a phone past
+// for ~250ms left jsQR no opportunity. Tightening to 2 / 100 gives jsQR ~32ms
+// after ZXing's first miss to catch the same presentation. Multi-scale + the
+// 100ms inter-attempt gap keep the per-second budget bounded.
+const ZXING_MISS_BEFORE_JSQR = 2;
+const JSQR_MIN_INTERVAL_MS = 100;
+
 function contrastStretch(gray: Uint8ClampedArray): Uint8ClampedArray {
     let min = 255;
     let max = 0;
-    for (let i = 0; i < gray.length; i += 4) {
+    for (let i = 0; i < gray.length; i++) {
         const v = gray[i];
         if (v < min) min = v;
         if (v > max) max = v;
@@ -111,6 +156,83 @@ function contrastStretch(gray: Uint8ClampedArray): Uint8ClampedArray {
     const out = new Uint8ClampedArray(gray.length);
     for (let i = 0; i < gray.length; i++) {
         out[i] = Math.max(0, Math.min(255, (gray[i] - min) * scale));
+    }
+    return out;
+}
+
+// Sauvola adaptive binarization via two integral images. Single O(n) pass
+// each: integralSum and integralSumSq. Window is square 2r+1 around each
+// pixel, clamped to image bounds. ~5ms at 640x360 in pure JS.
+//
+// Output is a Uint8ClampedArray of 0 / 255 values that can be wrapped as
+// ImageData and fed straight to jsQR. The high-contrast result reliably
+// recovers QRs that drown in global-threshold preprocessing because of
+// glare, vignette, or uneven illumination — the classic pyzbar wins.
+function sauvolaThreshold(gray: Uint8ClampedArray, w: number, h: number): Uint8ClampedArray {
+    const n = w * h;
+    // Use Float64Array for the integral images; Uint32 would overflow for
+    // sumSq at w*h > ~16M, and float math is fast enough at these sizes.
+    const integralSum = new Float64Array(n);
+    const integralSumSq = new Float64Array(n);
+
+    // First row.
+    let rowSum = 0;
+    let rowSumSq = 0;
+    for (let x = 0; x < w; x++) {
+        const v = gray[x];
+        rowSum += v;
+        rowSumSq += v * v;
+        integralSum[x] = rowSum;
+        integralSumSq[x] = rowSumSq;
+    }
+    // Remaining rows: I(x,y) = I(x-1,y) + I(x,y-1) - I(x-1,y-1) + pixel(x,y).
+    for (let y = 1; y < h; y++) {
+        let rs = 0;
+        let rss = 0;
+        const yOff = y * w;
+        const yPrev = yOff - w;
+        for (let x = 0; x < w; x++) {
+            const v = gray[yOff + x];
+            rs += v;
+            rss += v * v;
+            integralSum[yOff + x] = integralSum[yPrev + x] + rs;
+            integralSumSq[yOff + x] = integralSumSq[yPrev + x] + rss;
+        }
+    }
+
+    const r = (SAUVOLA_WINDOW - 1) >> 1;
+    const out = new Uint8ClampedArray(n);
+
+    for (let y = 0; y < h; y++) {
+        const y1 = Math.max(0, y - r - 1);
+        const y2 = Math.min(h - 1, y + r);
+        for (let x = 0; x < w; x++) {
+            const x1 = Math.max(0, x - r - 1);
+            const x2 = Math.min(w - 1, x + r);
+
+            // Inclusion-exclusion on the integral images.
+            // The "-1" indices are virtual; we handle them by checking
+            // whether x1 / y1 are at the top-left synthetic boundary.
+            const a = (x1 >= 0 && y1 >= 0) ? integralSum[y1 * w + x1] : 0;
+            const b = (y1 >= 0) ? integralSum[y1 * w + x2] : 0;
+            const c = (x1 >= 0) ? integralSum[y2 * w + x1] : 0;
+            const d = integralSum[y2 * w + x2];
+            const sum = d - b - c + a;
+
+            const aSq = (x1 >= 0 && y1 >= 0) ? integralSumSq[y1 * w + x1] : 0;
+            const bSq = (y1 >= 0) ? integralSumSq[y1 * w + x2] : 0;
+            const cSq = (x1 >= 0) ? integralSumSq[y2 * w + x1] : 0;
+            const dSq = integralSumSq[y2 * w + x2];
+            const sumSq = dSq - bSq - cSq + aSq;
+
+            const count = (x2 - x1) * (y2 - y1);
+            const mean = sum / count;
+            const variance = (sumSq / count) - mean * mean;
+            const std = variance > 0 ? Math.sqrt(variance) : 0;
+            const t = mean * (1 + SAUVOLA_K * (std / SAUVOLA_R - 1));
+
+            out[y * w + x] = gray[y * w + x] > t ? 255 : 0;
+        }
     }
     return out;
 }
@@ -148,11 +270,17 @@ export default function useScanner(props: IUseScannerProps) {
 
     const nativeDetectorRef = useRef<InstanceType<NonNullable<Window['BarcodeDetector']>> | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
-    const animationFrameIdRef = useRef<number | null>(null);
+    // Handle for the active frame-callback scheduler. We pick rVFC when the
+    // browser supports it (Chrome / Edge / Safari 16+) and fall back to rAF
+    // otherwise. Both expose a numeric handle; we tag the type so cancel
+    // dispatches to the right API.
+    const scheduleHandleRef = useRef<{ type: 'rvfc' | 'raf'; id: number } | null>(null);
     const decodeInFlightRef = useRef(false);
 
-    const workCanvasRef = useRef<HTMLCanvasElement | null>(null);
-    const workCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+    // Per-scale work canvas cache. Each jsQR scale uses its own canvas so we
+    // do not thrash the canvas dims on every frame and pay the underlying
+    // GPU-side reallocation cost.
+    const workCanvasesRef = useRef<Map<number, { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D }>>(new Map());
 
     const torchEngagedRef = useRef(false);
     const lowLumStreakRef = useRef(0);
@@ -162,26 +290,8 @@ export default function useScanner(props: IUseScannerProps) {
     const jsqrLastValueRef = useRef<string | null>(null);
     const jsqrStreakRef = useRef(0);
 
-    // Stuck-fallback gate. ZXing handles 99% of cases on its own and runs
-    // ~10-20ms per frame, so we want every frame to be a ZXing attempt
-    // (decoder saturates rAF at ~60fps). When ZXing misses
-    // ZXING_MISS_BEFORE_JSQR frames in a row (~80ms of no detection while
-    // the user is presenting a QR) we additionally run the jsQR passes as
-    // a second-opinion catch. jsQR sometimes catches edge cases ZXing does
-    // not (different finder pattern walk).
-    //
-    // At 1280x720 jsQR alone is ~120ms per frame which, if invoked every
-    // frame, drags the whole decoder down to ~3 fps. To prevent the
-    // stuck-fallback path from itself becoming the bottleneck we (a) cap
-    // the jsQR working dimensions at JSQR_MAX_DIM (cheap downsample, ZXing
-    // still uses the full-resolution video element), and (b) rate-limit
-    // jsQR invocations to one per JSQR_MIN_INTERVAL_MS so ZXing keeps
-    // running at near-full speed between jsQR attempts.
     const zxingMissStreakRef = useRef(0);
     const lastJsqrAttemptAtRef = useRef(0);
-    const ZXING_MISS_BEFORE_JSQR = 5;
-    const JSQR_MIN_INTERVAL_MS = 200;
-    const JSQR_MAX_DIM = 640;
 
     // Ref-mirrored pauseDecoding so the long-lived rAF chain reads the
     // latest value without rebuilding the loop on every toggle.
@@ -233,20 +343,35 @@ export default function useScanner(props: IUseScannerProps) {
         }
     }, [sound]);
 
+    // Clean up any cached work-canvases on unmount. They live as DOM
+    // detached elements; left around they just leak memory.
     useEffect(() => {
-        if (typeof document !== 'undefined') {
-            const c = document.createElement('canvas');
-            workCanvasRef.current = c;
-            workCtxRef.current = c.getContext('2d', { willReadFrequently: true });
-        }
+        return () => {
+            workCanvasesRef.current.clear();
+        };
     }, []);
 
-    const grabFrame = useCallback(
-        (videoEl: HTMLVideoElement): { gray: Uint8ClampedArray; width: number; height: number; meanLuma: number } | null => {
-            const canvas = workCanvasRef.current;
-            const ctx = workCtxRef.current;
-            if (!canvas || !ctx) return null;
+    const getWorkCanvas = useCallback((outW: number, outH: number) => {
+        const key = outW * 100000 + outH;
+        let entry = workCanvasesRef.current.get(key);
+        if (!entry) {
+            const canvas = document.createElement('canvas');
+            canvas.width = outW;
+            canvas.height = outH;
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            if (!ctx) return null;
+            entry = { canvas, ctx };
+            workCanvasesRef.current.set(key, entry);
+        }
+        return entry;
+    }, []);
 
+    // grabFrame downsamples the ROI crop to the given max-edge. Multi-scale
+    // jsQR calls this per scale to get pyzbar-style multi-resolution decode
+    // attempts. Returns a greyscale buffer plus mean luma for the auto-torch
+    // heuristic (caller updates torch only once per video frame).
+    const grabFrame = useCallback(
+        (videoEl: HTMLVideoElement, maxDim: number): { gray: Uint8ClampedArray; width: number; height: number; meanLuma: number } | null => {
             const vw = videoEl.videoWidth;
             const vh = videoEl.videoHeight;
             if (vw === 0 || vh === 0) return null;
@@ -256,20 +381,16 @@ export default function useScanner(props: IUseScannerProps) {
             const sx = Math.floor((vw - cropW) / 2);
             const sy = Math.floor((vh - cropH) / 2);
 
-            // Downscale to JSQR_MAX_DIM on the longer edge if the camera is
-            // running at HD or above. jsQR cost scales with pixel count, so
-            // 1280x720 -> 640x360 is a ~4x speedup with negligible loss for
-            // typical kiosk QR sizes. Cameras already capped at <= 640
-            // (older USB / VGA) skip the scale and pass through unchanged.
             const longestEdge = Math.max(cropW, cropH);
-            const scale = longestEdge > JSQR_MAX_DIM ? JSQR_MAX_DIM / longestEdge : 1;
+            const scale = longestEdge > maxDim ? maxDim / longestEdge : 1;
             const outW = Math.max(1, Math.round(cropW * scale));
             const outH = Math.max(1, Math.round(cropH * scale));
 
-            if (canvas.width !== outW || canvas.height !== outH) {
-                canvas.width = outW;
-                canvas.height = outH;
-            }
+            const entry = getWorkCanvas(outW, outH);
+            if (!entry) return null;
+            const { canvas, ctx } = entry;
+            if (canvas.width !== outW) canvas.width = outW;
+            if (canvas.height !== outH) canvas.height = outH;
 
             ctx.drawImage(videoEl, sx, sy, cropW, cropH, 0, 0, outW, outH);
             const img = ctx.getImageData(0, 0, outW, outH);
@@ -283,7 +404,7 @@ export default function useScanner(props: IUseScannerProps) {
             }
             return { gray, width: outW, height: outH, meanLuma: lumaSum / gray.length };
         },
-        [roi]
+        [roi, getWorkCanvas]
     );
 
     const updateAutoTorch = useCallback(
@@ -333,9 +454,6 @@ export default function useScanner(props: IUseScannerProps) {
                 } catch (err) {
                     nativeMissed = true;
                     zxingMissStreakRef.current++;
-                    // detect() occasionally throws on torn frames; ignore and
-                    // log only the very first occurrence per session so the
-                    // breadcrumb stays without per-frame noise.
                     if (zxingMissStreakRef.current === 1) {
                         // eslint-disable-next-line no-console
                         console.log('[QR-fork] BarcodeDetector threw', err);
@@ -343,13 +461,10 @@ export default function useScanner(props: IUseScannerProps) {
                 }
             }
 
-            // When ZXing is the active path, the per-frame jsQR work is the
-            // dominant cost (even after downsampling — still ~25ms). Two
-            // gates: (a) miss streak must reach ZXING_MISS_BEFORE_JSQR
-            // before jsQR is allowed to run at all, and (b) once unlocked
-            // jsQR runs at most once per JSQR_MIN_INTERVAL_MS so ZXing keeps
-            // ticking at near-rAF cadence between attempts. Without (b) a
-            // long miss streak would pin the decoder to jsQR's frame budget.
+            // jsQR fallback gating. After ZXING_MISS_BEFORE_JSQR consecutive
+            // ZXing misses, we run jsQR at multiple scales. JSQR_MIN_INTERVAL_MS
+            // keeps the rolling cost bounded so ZXing still gets the bulk of
+            // the per-second budget.
             if (native && nativeMissed) {
                 if (zxingMissStreakRef.current < ZXING_MISS_BEFORE_JSQR) {
                     return [];
@@ -361,23 +476,46 @@ export default function useScanner(props: IUseScannerProps) {
                 lastJsqrAttemptAtRef.current = nowTs;
             }
 
-            // Pass 2..3: jsQR on a preprocessed greyscale frame. Pure JS,
-            // bundled, works offline. Inversion attempts handle white-on-dark
-            // codes.
-            const frame = grabFrame(videoEl);
-            if (!frame) {
-                return [];
-            }
-            updateAutoTorch(frame.meanLuma);
+            // Multi-scale jsQR. Pyzbar-style: try the same frame at three
+            // resolutions. First scale that yields a hit short-circuits the
+            // rest. Per scale, we try three binarization variants:
+            //   1. raw greyscale
+            //   2. globally contrast-stretched (cheap; recovers low-dynamic
+            //      range frames)
+            //   3. Sauvola adaptive threshold (recovers glare / uneven
+            //      lighting — the main pyzbar win)
+            // jsQR's `inversionAttempts: 'attemptBoth'` lets a single call
+            // catch both light-on-dark and dark-on-light codes.
+            let value: string | null = null;
+            let lumaUpdated = false;
 
-            const tryJsQr = (gray: Uint8ClampedArray): string | null => {
-                const imgData = grayToImageData(gray, frame.width, frame.height);
-                const res = jsQR(imgData.data, frame.width, frame.height, { inversionAttempts: 'attemptBoth' });
-                if (!res) return null;
-                const v = res.data;
-                if (!v || v.length < MIN_PAYLOAD_LEN) return null;
-                return v;
-            };
+            for (const maxDim of JSQR_SCALES) {
+                const frame = grabFrame(videoEl, maxDim);
+                if (!frame) continue;
+
+                if (!lumaUpdated) {
+                    updateAutoTorch(frame.meanLuma);
+                    lumaUpdated = true;
+                }
+
+                const tryDecode = (buf: Uint8ClampedArray): string | null => {
+                    const imgData = grayToImageData(buf, frame.width, frame.height);
+                    const res = jsQR(imgData.data, frame.width, frame.height, { inversionAttempts: 'attemptBoth' });
+                    if (!res) return null;
+                    const v = res.data;
+                    if (!v || v.length < MIN_PAYLOAD_LEN) return null;
+                    return v;
+                };
+
+                value = tryDecode(frame.gray);
+                if (!value) {
+                    value = tryDecode(contrastStretch(frame.gray));
+                }
+                if (!value) {
+                    value = tryDecode(sauvolaThreshold(frame.gray, frame.width, frame.height));
+                }
+                if (value) break;
+            }
 
             const buildBarcode = (rawValue: string): IDetectedBarcode => ({
                 rawValue,
@@ -391,14 +529,7 @@ export default function useScanner(props: IUseScannerProps) {
                 cornerPoints: []
             });
 
-            let value = tryJsQr(frame.gray);
-            if (!value) {
-                const stretched = contrastStretch(frame.gray);
-                value = tryJsQr(stretched);
-            }
-
             if (value === null) {
-                // No hit — reset confirmation streak.
                 jsqrLastValueRef.current = null;
                 jsqrStreakRef.current = 0;
                 return [];
@@ -429,23 +560,53 @@ export default function useScanner(props: IUseScannerProps) {
         [grabFrame, updateAutoTorch]
     );
 
+    // Reschedule the next decode tick. Prefer requestVideoFrameCallback when
+    // supported — it fires on actual new video frames, so we never burn CPU
+    // re-decoding an unchanged frame the way rAF does when the camera runs
+    // at <60fps. Falls back to rAF on Firefox <130 / older browsers.
+    const scheduleNext = useCallback(
+        (cb: (now: number) => void) => {
+            const videoEl = videoElementRef.current;
+            if (videoEl && typeof videoEl.requestVideoFrameCallback === 'function') {
+                const id = videoEl.requestVideoFrameCallback((now: number) => cb(now));
+                scheduleHandleRef.current = { type: 'rvfc', id };
+            } else {
+                const id = window.requestAnimationFrame(cb);
+                scheduleHandleRef.current = { type: 'raf', id };
+            }
+        },
+        [videoElementRef]
+    );
+
+    const cancelScheduled = useCallback(() => {
+        const h = scheduleHandleRef.current;
+        if (!h) return;
+        const videoEl = videoElementRef.current;
+        if (h.type === 'rvfc' && videoEl && typeof videoEl.cancelVideoFrameCallback === 'function') {
+            videoEl.cancelVideoFrameCallback(h.id);
+        } else if (h.type === 'raf') {
+            window.cancelAnimationFrame(h.id);
+        }
+        scheduleHandleRef.current = null;
+    }, [videoElementRef]);
+
     const processFrame = useCallback(
         (state: IUseScannerState) => async (timeNow: number) => {
             const videoEl = videoElementRef.current;
             if (videoEl === null || videoEl.readyState <= 1) {
-                animationFrameIdRef.current = window.requestAnimationFrame(processFrame(state));
+                scheduleNext(processFrame(state));
                 return;
             }
 
             const { lastScan, contentBefore, lastScanHadContent } = state;
 
             if (retryDelay > 0 && timeNow - lastScan < retryDelay) {
-                animationFrameIdRef.current = window.requestAnimationFrame(processFrame(state));
+                scheduleNext(processFrame(state));
                 return;
             }
 
             if (decodeInFlightRef.current) {
-                animationFrameIdRef.current = window.requestAnimationFrame(processFrame(state));
+                scheduleNext(processFrame(state));
                 return;
             }
 
@@ -454,7 +615,7 @@ export default function useScanner(props: IUseScannerProps) {
                 // resume on the SAME stale code does not immediately fire.
                 jsqrLastValueRef.current = null;
                 jsqrStreakRef.current = 0;
-                animationFrameIdRef.current = window.requestAnimationFrame(processFrame(state));
+                scheduleNext(processFrame(state));
                 return;
             }
 
@@ -494,9 +655,9 @@ export default function useScanner(props: IUseScannerProps) {
                 contentBefore: anyNewCodesDetected ? detectedCodes.map((c) => c.rawValue) : contentBefore
             };
 
-            animationFrameIdRef.current = window.requestAnimationFrame(processFrame(newState));
+            scheduleNext(processFrame(newState));
         },
-        [videoElementRef, onScan, onFound, retryDelay, scanDelay, allowMultiple, sound, decodeMultiPass]
+        [videoElementRef, onScan, onFound, retryDelay, scanDelay, allowMultiple, sound, decodeMultiPass, scheduleNext]
     );
 
     const startScanning = useCallback(() => {
@@ -507,14 +668,11 @@ export default function useScanner(props: IUseScannerProps) {
             contentBefore: [],
             lastScanHadContent: false
         };
-        animationFrameIdRef.current = window.requestAnimationFrame(processFrame(initialState));
-    }, [processFrame]);
+        scheduleNext(processFrame(initialState));
+    }, [processFrame, scheduleNext]);
 
     const stopScanning = useCallback(() => {
-        if (animationFrameIdRef.current !== null) {
-            window.cancelAnimationFrame(animationFrameIdRef.current);
-            animationFrameIdRef.current = null;
-        }
+        cancelScheduled();
         // Physically disengage torch if we turned it on. Downstream face
         // recognition needs the camera with no LED flooding the subject.
         if (torchEngagedRef.current && onAutoTorch) {
@@ -531,7 +689,7 @@ export default function useScanner(props: IUseScannerProps) {
         jsqrStreakRef.current = 0;
         zxingMissStreakRef.current = 0;
         lastJsqrAttemptAtRef.current = 0;
-    }, [onAutoTorch]);
+    }, [onAutoTorch, cancelScheduled]);
 
     return {
         startScanning,
